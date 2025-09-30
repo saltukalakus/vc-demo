@@ -4,11 +4,6 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use axum_sessions::{
-    async_session::MemoryStore,
-    extractors::WritableSession,
-    SessionLayer,
-};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::Utc;
 use dotenv::dotenv;
@@ -21,9 +16,10 @@ use openidconnect::{
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
-use tokio::sync::OnceCell;
+use tokio::{net::TcpListener, sync::OnceCell};
 use uuid::Uuid;
 use sha2::{Digest, Sha512};
+use tower_sessions::{cookie::Key, MemoryStore, Session, SessionManagerLayer};
 
 // Shared OpenID client in app state
 static OIDC_CLIENT: OnceCell<CoreClient> = OnceCell::const_new();
@@ -58,9 +54,13 @@ async fn main() {
     OIDC_CLIENT.set(client).unwrap();
 
     // Session middleware
-    let secret = derive_session_secret();
-    let store = MemoryStore::new();
-    let session_layer = SessionLayer::new(store, secret.as_slice()).with_secure(false);
+    let secret_bytes = derive_session_secret();
+    let key = Key::try_from(secret_bytes.as_slice())
+        .expect("SESSION_SECRET must resolve to at least 64 bytes");
+    let store = MemoryStore::default();
+    let session_layer = SessionManagerLayer::new(store)
+        .with_private(key)
+        .with_secure(false);
 
     // Build the router
     let app = Router::new()
@@ -71,15 +71,20 @@ async fn main() {
         .layer(session_layer);
 
     println!("Listening on http://localhost:8080");
-    axum::Server::bind(&"0.0.0.0:8080".parse().unwrap())
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 // Public landing page
-async fn index(session: WritableSession) -> impl IntoResponse {
-    let logged_in = session.get::<String>("id_token").is_some();
+async fn index(session: Session) -> impl IntoResponse {
+    let logged_in = session
+        .get::<String>("id_token")
+        .await
+        .map(|value| value.is_some())
+        .unwrap_or_else(|err| {
+            eprintln!("Failed to read id_token from session: {err}");
+            false
+        });
     let html = if logged_in {
         r#"<h2>Authenticated</h2>
            <a href="/issue-vc">Issue VC</a>"#
@@ -90,7 +95,7 @@ async fn index(session: WritableSession) -> impl IntoResponse {
 }
 
 // Redirect user to Auth0
-async fn login(mut session: WritableSession) -> impl IntoResponse {
+async fn login(session: Session) -> impl IntoResponse {
     let client = OIDC_CLIENT.get().unwrap();
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let (auth_url, csrf_token, nonce) = client
@@ -103,47 +108,66 @@ async fn login(mut session: WritableSession) -> impl IntoResponse {
         .add_scope(Scope::new("openid".into()))
         .url();
 
-    session.remove("id_token");
-    session
+    if let Err(err) = session.remove::<String>("id_token").await {
+        eprintln!("Failed to clear id_token from session: {err}");
+    }
+    if let Err(err) = session
         .insert("pkce_verifier", pkce_verifier.secret().to_string())
-        .unwrap();
-    session
+        .await
+    {
+        eprintln!("Failed to store PKCE verifier in session: {err}");
+    }
+    if let Err(err) = session
         .insert("csrf_state", csrf_token.secret().to_string())
-        .unwrap();
-    session
+        .await
+    {
+        eprintln!("Failed to store CSRF state in session: {err}");
+    }
+    if let Err(err) = session
         .insert("nonce", nonce.secret().to_string())
-        .unwrap();
+        .await
+    {
+        eprintln!("Failed to store nonce in session: {err}");
+    }
 
     Redirect::to(auth_url.as_ref())
 }
 
 // Handle Auth0 callback and store ID token
 async fn callback(
-    mut session: WritableSession,
+    session: Session,
     Query(params): Query<CallbackParams>,
 ) -> impl IntoResponse {
     let client = OIDC_CLIENT.get().unwrap();
 
-    let stored_csrf = match session.get::<String>("csrf_state") {
-        Some(value) => value,
-        None => return Html("CSRF check failed".to_string()).into_response(),
+    let stored_csrf = match session.remove::<String>("csrf_state").await {
+        Ok(Some(value)) => value,
+        Ok(None) => return Html("CSRF check failed".to_string()).into_response(),
+        Err(err) => {
+            eprintln!("Failed to load csrf_state from session: {err}");
+            return Html("Session error".to_string()).into_response();
+        }
     };
     if params.state != stored_csrf {
         return Html("CSRF check failed".to_string()).into_response();
     }
 
-    session.remove("csrf_state");
-
-    let pkce = match session.get::<String>("pkce_verifier") {
-        Some(value) => value,
-        None => return Html("Missing PKCE verifier".to_string()).into_response(),
+    let pkce = match session.remove::<String>("pkce_verifier").await {
+        Ok(Some(value)) => value,
+        Ok(None) => return Html("Missing PKCE verifier".to_string()).into_response(),
+        Err(err) => {
+            eprintln!("Failed to load pkce_verifier from session: {err}");
+            return Html("Session error".to_string()).into_response();
+        }
     };
-    session.remove("pkce_verifier");
-    let nonce = match session.get::<String>("nonce") {
-        Some(value) => value,
-        None => return Html("Missing nonce".to_string()).into_response(),
+    let nonce = match session.remove::<String>("nonce").await {
+        Ok(Some(value)) => value,
+        Ok(None) => return Html("Missing nonce".to_string()).into_response(),
+        Err(err) => {
+            eprintln!("Failed to load nonce from session: {err}");
+            return Html("Session error".to_string()).into_response();
+        }
     };
-    session.remove("nonce");
     let pkce_verifier = PkceCodeVerifier::new(pkce);
     let token = client
         .exchange_code(AuthorizationCode::new(params.code))
@@ -156,16 +180,16 @@ async fn callback(
     let _claims = id_token
         .claims(&client.id_token_verifier(), &Nonce::new(nonce.clone()))
         .unwrap();
-    session
-        .insert("id_token", id_token.to_string())
-        .unwrap();
+    if let Err(err) = session.insert("id_token", id_token.to_string()).await {
+        eprintln!("Failed to store id_token in session: {err}");
+    }
 
     Redirect::to("/issue-vc").into_response()
 }
 
 // Issue and return a signed VC as JSON
-async fn issue_vc(session: WritableSession) -> impl IntoResponse {
-    if let Some(id_token) = session.get::<String>("id_token") {
+async fn issue_vc(session: Session) -> impl IntoResponse {
+    if let Ok(Some(id_token)) = session.get::<String>("id_token").await {
         let credential = json!({
             "@context": ["https://www.w3.org/2018/credentials/v1"],
             "id": format!("urn:uuid:{}", Uuid::new_v4()),

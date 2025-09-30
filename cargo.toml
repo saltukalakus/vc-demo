@@ -4,11 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = { version = "0.6", features = ["headers"] }
+axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 openidconnect = { version = "3.4.0", default-features = false, features = ["reqwest"] }
-axum-sessions = "0.6.1"
-async-session = "3.0.0"
+tower-sessions = { version = "0.14.0", features = ["private"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1.0.228", features = ["derive", "alloc"] }
