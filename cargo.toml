@@ -16,3 +16,4 @@ dotenv = "0.15"
 sha2 = "0.10"
 base64 = "0.21"
 ssi = { version = "0.12", default-features = false, features = ["w3c", "ed25519"] }
+qrcode = "0.12"

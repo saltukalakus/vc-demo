@@ -25,6 +25,7 @@ Verifiable Credentials
 	 ```
 
 2. Navigate to <http://localhost:8080>, authenticate with Auth0, then visit `/issue-vc` to receive a SpruceID-signed Verifiable Credential containing your ID token.
+3. To load a credential into a digital wallet, open `/issue-vc/qr`. The page renders a scannable QR code plus the raw payload so you can transfer the credential without downloading JSON manually.
 
 ### Issuance details
 
@@ -34,3 +35,4 @@ Verifiable Credentials
 	- Contexts: the W3C VC v1 context plus an Auth0-specific extension.
 	- Types: `VerifiableCredential` and `Auth0IdTokenCredential`.
 	- Subject: a unique UUID identifier and the raw ID token that Auth0 returned during login.
+- The QR endpoint embeds the full signed credential (minified JSON) in the code. Clients decoding the QR can store the credential directly without performing an additional network fetch.

@@ -7,13 +7,18 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use dotenv::dotenv;
-use ssi::json_ld::IriBuf;
 use openidconnect::{
     core::{CoreClient, CoreProviderMetadata, CoreResponseType},
     reqwest::async_http_client,
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
 };
+use qrcode::{render::svg, QrCode};
+use serde::Deserialize;
+use serde_json::json;
+use sha2::{Digest, Sha512};
+use ssi::dids::DIDKey;
+use ssi::json_ld::IriBuf;
 use ssi::{
     claims::{
         data_integrity::{AnySuite, CryptographicSuite, ProofOptions},
@@ -25,14 +30,10 @@ use ssi::{
     verification_methods::{AnyMethod, ProofPurpose, ReferenceOrOwned, SingleSecretSigner},
     xsd::DateTime,
 };
-use serde::Deserialize;
-use serde_json::json;
-use sha2::{Digest, Sha512};
 use std::{env, sync::Arc};
 use tokio::{net::TcpListener, sync::OnceCell};
-use uuid::Uuid;
 use tower_sessions::{cookie::Key, MemoryStore, Session, SessionManagerLayer};
-use ssi::dids::DIDKey;
+use uuid::Uuid;
 
 // Shared OpenID client in app state
 static OIDC_CLIENT: OnceCell<CoreClient> = OnceCell::const_new();
@@ -66,9 +67,7 @@ async fn main() {
     let client = CoreClient::from_provider_metadata(
         meta,
         ClientId::new(env::var("AUTH0_CLIENT_ID").unwrap()),
-        Some(ClientSecret::new(
-            env::var("AUTH0_CLIENT_SECRET").unwrap(),
-        )),
+        Some(ClientSecret::new(env::var("AUTH0_CLIENT_SECRET").unwrap())),
     )
     .set_redirect_uri(RedirectUrl::new(env::var("AUTH0_REDIRECT_URL").unwrap()).unwrap());
 
@@ -94,6 +93,7 @@ async fn main() {
         .route("/login", get(login))
         .route("/callback", get(callback))
         .route("/issue-vc", get(issue_vc))
+        .route("/issue-vc/qr", get(issue_vc_qr))
         .layer(session_layer);
 
     println!("Listening on http://localhost:8080");
@@ -149,10 +149,7 @@ async fn login(session: Session) -> impl IntoResponse {
     {
         eprintln!("Failed to store CSRF state in session: {err}");
     }
-    if let Err(err) = session
-        .insert("nonce", nonce.secret().to_string())
-        .await
-    {
+    if let Err(err) = session.insert("nonce", nonce.secret().to_string()).await {
         eprintln!("Failed to store nonce in session: {err}");
     }
 
@@ -160,10 +157,7 @@ async fn login(session: Session) -> impl IntoResponse {
 }
 
 // Handle Auth0 callback and store ID token
-async fn callback(
-    session: Session,
-    Query(params): Query<CallbackParams>,
-) -> impl IntoResponse {
+async fn callback(session: Session, Query(params): Query<CallbackParams>) -> impl IntoResponse {
     let client = OIDC_CLIENT.get().unwrap();
 
     let stored_csrf = match session.remove::<String>("csrf_state").await {
@@ -241,6 +235,118 @@ async fn issue_vc(session: Session) -> impl IntoResponse {
     }
 }
 
+async fn issue_vc_qr(session: Session) -> impl IntoResponse {
+    let id_token = match session.get::<String>("id_token").await {
+        Ok(Some(token)) => token,
+        Ok(None) => return Html("Unauthorized: please log in first".to_string()).into_response(),
+        Err(err) => {
+            eprintln!("Failed to read id_token from session: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Session error".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    match issue_signed_vc(id_token).await {
+        Ok(credential) => {
+            let payload = match serde_json::to_string(&credential) {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("Failed to serialize credential to string: {err}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to prepare credential payload".to_string(),
+                    )
+                        .into_response();
+                }
+            };
+
+            let qr_code = match QrCode::new(&payload) {
+                Ok(code) => code,
+                Err(err) => {
+                    eprintln!("Failed to encode credential into QR: {err}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Credential payload is too large to encode as QR".to_string(),
+                    )
+                        .into_response();
+                }
+            };
+
+            let svg_image = qr_code
+                .render::<svg::Color>()
+                .min_dimensions(320, 320)
+                .max_dimensions(320, 320)
+                .dark_color(svg::Color("#0f172a"))
+                .light_color(svg::Color("#ffffff"))
+                .build();
+
+            let data_uri = format!(
+                "data:image/svg+xml;base64,{}",
+                BASE64_STANDARD.encode(svg_image.as_bytes())
+            );
+
+            let pretty_json = match serde_json::to_string_pretty(&credential) {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("Failed to produce pretty credential JSON: {err}");
+                    String::new()
+                }
+            };
+
+            let html = format!(
+                r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Auth0 VC QR Code</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #0f172a; background-color: #f8fafc; }}
+    h1, h2 {{ color: #0f172a; }}
+    .card {{ background: #ffffff; padding: 1.5rem; border-radius: 0.75rem; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.1); max-width: 640px; margin: 0 auto; }}
+    .qr {{ display: flex; justify-content: center; margin: 2rem 0; }}
+    img {{ border: 12px solid #ffffff; border-radius: 1rem; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12); }}
+    textarea {{ width: 100%; min-height: 160px; margin-top: 0.75rem; border-radius: 0.5rem; border: 1px solid #cbd5f5; padding: 0.75rem; font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 0.85rem; background: #f1f5f9; color: #0f172a; }}
+    pre {{ background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; font-size: 0.85rem; }}
+    .hint {{ color: #475569; font-size: 0.95rem; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Verifiable Credential QR Code</h1>
+    <p class="hint">Scan this QR code with a compatible digital wallet to add the issued credential. The QR encodes the signed credential in compact JSON form.</p>
+    <div class="qr">
+      <img src="{data_uri}" alt="Verifiable Credential QR" width="320" height="320" />
+    </div>
+    <h2>Raw QR payload</h2>
+    <p class="hint">Copy this value if you need to transfer the credential without scanning the QR code.</p>
+    <textarea readonly>{raw_payload}</textarea>
+    <h2>Pretty JSON</h2>
+    <pre>{credential_json}</pre>
+  </div>
+</body>
+</html>"#,
+                data_uri = data_uri,
+                raw_payload = html_escape(&payload),
+                credential_json = html_escape(&pretty_json),
+            );
+
+            Html(html).into_response()
+        }
+        Err(message) => {
+            eprintln!("Failed to issue credential: {message}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to issue credential".to_string(),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn issue_signed_vc(id_token: String) -> Result<serde_json::Value, String> {
     let config = ISSUER_CONFIG
         .get()
@@ -296,23 +402,20 @@ async fn issue_signed_vc(id_token: String) -> Result<serde_json::Value, String> 
         return Err(format!("Credential verification failed: {err}"));
     }
 
-    serde_json::to_value(&signed_vc)
-        .map_err(|err| format!("Failed to serialize credential: {err}"))
+    serde_json::to_value(&signed_vc).map_err(|err| format!("Failed to serialize credential: {err}"))
 }
 
 fn load_issuer_config() -> IssuerConfig {
     let mut jwk = match env::var("ISSUER_JWK") {
         Ok(jwk_raw) => {
-            let parsed: JWK = serde_json::from_str(&jwk_raw)
-                .expect("ISSUER_JWK must be valid JWK JSON");
+            let parsed: JWK =
+                serde_json::from_str(&jwk_raw).expect("ISSUER_JWK must be valid JWK JSON");
             parsed
         }
         Err(env::VarError::NotPresent) => {
-            let generated = JWK::generate_ed25519()
-                .expect("Failed to generate fallback Ed25519 key");
-            eprintln!(
-                "ISSUER_JWK not set; generated an ephemeral Ed25519 key for this process"
-            );
+            let generated =
+                JWK::generate_ed25519().expect("Failed to generate fallback Ed25519 key");
+            eprintln!("ISSUER_JWK not set; generated an ephemeral Ed25519 key for this process");
             generated
         }
         Err(env::VarError::NotUnicode(_)) => {
@@ -336,8 +439,8 @@ fn load_issuer_config() -> IssuerConfig {
         .expect("Unable to derive verification method from ISSUER_JWK")
         .to_string();
 
-    let verification_method = env::var("ISSUER_VERIFICATION_METHOD")
-        .unwrap_or(default_verification_method);
+    let verification_method =
+        env::var("ISSUER_VERIFICATION_METHOD").unwrap_or(default_verification_method);
 
     if jwk.key_id.is_none() {
         jwk.key_id = Some(verification_method.clone());
@@ -351,8 +454,7 @@ fn load_issuer_config() -> IssuerConfig {
 }
 
 fn derive_session_secret() -> Vec<u8> {
-    let raw = env::var("SESSION_SECRET")
-        .expect("SESSION_SECRET environment variable must be set");
+    let raw = env::var("SESSION_SECRET").expect("SESSION_SECRET environment variable must be set");
 
     if let Ok(decoded) = BASE64_STANDARD.decode(raw.as_bytes()) {
         if decoded.len() >= 64 {
@@ -372,4 +474,13 @@ fn derive_session_secret() -> Vec<u8> {
     let mut hasher = Sha512::new();
     hasher.update(&raw_bytes);
     hasher.finalize().to_vec()
+}
+
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
