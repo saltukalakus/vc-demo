@@ -13,6 +13,6 @@ uuid = { version = "1", features = ["v4"] }
 serde = { version = "1.0.228", features = ["derive", "alloc"] }
 serde_json = "1.0.145"
 dotenv = "0.15"
-chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 base64 = "0.21"
+ssi = { version = "0.12", default-features = false, features = ["w3c", "ed25519"] }

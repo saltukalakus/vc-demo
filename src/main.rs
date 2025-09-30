@@ -1,33 +1,54 @@
 use axum::{
     extract::Query,
+    http::StatusCode,
     response::{Html, IntoResponse, Redirect},
     routing::get,
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use chrono::Utc;
 use dotenv::dotenv;
+use ssi::json_ld::IriBuf;
 use openidconnect::{
     core::{CoreClient, CoreProviderMetadata, CoreResponseType},
     reqwest::async_http_client,
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
 };
+use ssi::{
+    claims::{
+        data_integrity::{AnySuite, CryptographicSuite, ProofOptions},
+        vc::v1::JsonCredential,
+        VerificationParameters,
+    },
+    dids::{AnyDidMethod, VerificationMethodDIDResolver},
+    jwk::{Algorithm, JWK},
+    verification_methods::{AnyMethod, ProofPurpose, ReferenceOrOwned, SingleSecretSigner},
+    xsd::DateTime,
+};
 use serde::Deserialize;
 use serde_json::json;
-use std::env;
+use sha2::{Digest, Sha512};
+use std::{env, sync::Arc};
 use tokio::{net::TcpListener, sync::OnceCell};
 use uuid::Uuid;
-use sha2::{Digest, Sha512};
 use tower_sessions::{cookie::Key, MemoryStore, Session, SessionManagerLayer};
+use ssi::dids::DIDKey;
 
 // Shared OpenID client in app state
 static OIDC_CLIENT: OnceCell<CoreClient> = OnceCell::const_new();
+static ISSUER_CONFIG: OnceCell<IssuerConfig> = OnceCell::const_new();
 
 #[derive(Deserialize)]
 struct CallbackParams {
     code: String,
     state: String,
+}
+
+#[derive(Clone, Debug)]
+struct IssuerConfig {
+    jwk: Arc<JWK>,
+    issuer: String,
+    verification_method: String,
 }
 
 #[tokio::main]
@@ -52,6 +73,11 @@ async fn main() {
     .set_redirect_uri(RedirectUrl::new(env::var("AUTH0_REDIRECT_URL").unwrap()).unwrap());
 
     OIDC_CLIENT.set(client).unwrap();
+
+    let issuer_config = load_issuer_config();
+    ISSUER_CONFIG
+        .set(issuer_config)
+        .expect("ISSUER_CONFIG should only be initialized once");
 
     // Session middleware
     let secret_bytes = derive_session_secret();
@@ -189,26 +215,139 @@ async fn callback(
 
 // Issue and return a signed VC as JSON
 async fn issue_vc(session: Session) -> impl IntoResponse {
-    if let Ok(Some(id_token)) = session.get::<String>("id_token").await {
-        let credential = json!({
-            "@context": ["https://www.w3.org/2018/credentials/v1"],
-            "id": format!("urn:uuid:{}", Uuid::new_v4()),
-            "type": ["VerifiableCredential"],
-            "issuer": {
-                "id": format!("did:example:issuer:{}", Uuid::new_v4()),
-                "name": "Axum VC Demo"
-            },
-            "issuanceDate": Utc::now().to_rfc3339(),
-            "credentialSubject": {
-                "id": format!("did:example:subject:{}", Uuid::new_v4()),
-                "id_token": id_token,
-            }
-        });
+    let id_token = match session.get::<String>("id_token").await {
+        Ok(Some(token)) => token,
+        Ok(None) => return Html("Unauthorized: please log in first".to_string()).into_response(),
+        Err(err) => {
+            eprintln!("Failed to read id_token from session: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Session error".to_string(),
+            )
+                .into_response();
+        }
+    };
 
-        return Json(credential).into_response();
+    match issue_signed_vc(id_token).await {
+        Ok(credential) => Json(credential).into_response(),
+        Err(message) => {
+            eprintln!("Failed to issue credential: {message}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to issue credential".to_string(),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn issue_signed_vc(id_token: String) -> Result<serde_json::Value, String> {
+    let config = ISSUER_CONFIG
+        .get()
+        .ok_or_else(|| "Issuer configuration is not initialized".to_string())?;
+
+    let credential_json = json!({
+        "@context": [
+            "https://www.w3.org/2018/credentials/v1",
+            {
+                "Auth0IdTokenCredential": "https://schemas.auth0.com/credentials/Auth0IdTokenCredential",
+                "idToken": "https://schemas.auth0.com/claims/idToken"
+            }
+        ],
+        "type": ["VerifiableCredential", "Auth0IdTokenCredential"],
+        "issuer": config.issuer,
+        "issuanceDate": DateTime::now(),
+        "id": format!("urn:uuid:{}", Uuid::new_v4()),
+        "credentialSubject": {
+            "id": format!("urn:uuid:{}", Uuid::new_v4()),
+            "idToken": id_token,
+        }
+    });
+
+    let credential: JsonCredential = serde_json::from_value(credential_json)
+        .map_err(|err| format!("Failed to construct credential payload: {err}"))?;
+
+    let vm_iri = IriBuf::new(config.verification_method.clone())
+        .map_err(|err| format!("Invalid verification method URI: {err}"))?;
+
+    let mut proof_options = ProofOptions::from_method(ReferenceOrOwned::Reference(vm_iri));
+    proof_options.proof_purpose = ProofPurpose::Assertion;
+
+    let resolver = VerificationMethodDIDResolver::<_, AnyMethod>::new(AnyDidMethod::default());
+    let jwk = (*config.jwk).clone();
+    let signer = SingleSecretSigner::new(jwk.clone()).into_local();
+
+    let suite = AnySuite::pick(&jwk, proof_options.verification_method.as_ref())
+        .ok_or_else(|| "No compatible signature suite for the configured key".to_string())?;
+
+    let signed_vc = suite
+        .sign(credential, &resolver, &signer, proof_options)
+        .await
+        .map_err(|err| format!("Failed to sign credential: {err}"))?;
+
+    let verification = signed_vc
+        .verify(VerificationParameters::from_resolver(
+            VerificationMethodDIDResolver::<_, AnyMethod>::new(AnyDidMethod::default()),
+        ))
+        .await
+        .map_err(|err| format!("Failed to verify issued credential: {err}"))?;
+
+    if let Err(err) = verification {
+        return Err(format!("Credential verification failed: {err}"));
     }
 
-    Html("Unauthorized: please log in first".to_string()).into_response()
+    serde_json::to_value(&signed_vc)
+        .map_err(|err| format!("Failed to serialize credential: {err}"))
+}
+
+fn load_issuer_config() -> IssuerConfig {
+    let mut jwk = match env::var("ISSUER_JWK") {
+        Ok(jwk_raw) => {
+            let parsed: JWK = serde_json::from_str(&jwk_raw)
+                .expect("ISSUER_JWK must be valid JWK JSON");
+            parsed
+        }
+        Err(env::VarError::NotPresent) => {
+            let generated = JWK::generate_ed25519()
+                .expect("Failed to generate fallback Ed25519 key");
+            eprintln!(
+                "ISSUER_JWK not set; generated an ephemeral Ed25519 key for this process"
+            );
+            generated
+        }
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("ISSUER_JWK contained invalid UTF-8 data")
+        }
+    };
+
+    if jwk.algorithm.is_none() {
+        jwk.algorithm = Some(Algorithm::EdDSA);
+    }
+
+    let public_jwk = jwk.to_public();
+
+    let default_issuer = DIDKey::generate(&public_jwk)
+        .expect("Unable to derive did:key identifier from ISSUER_JWK")
+        .to_string();
+
+    let issuer = env::var("ISSUER_DID").unwrap_or(default_issuer);
+
+    let default_verification_method = DIDKey::generate_url(&public_jwk)
+        .expect("Unable to derive verification method from ISSUER_JWK")
+        .to_string();
+
+    let verification_method = env::var("ISSUER_VERIFICATION_METHOD")
+        .unwrap_or(default_verification_method);
+
+    if jwk.key_id.is_none() {
+        jwk.key_id = Some(verification_method.clone());
+    }
+
+    IssuerConfig {
+        jwk: Arc::new(jwk),
+        issuer,
+        verification_method,
+    }
 }
 
 fn derive_session_secret() -> Vec<u8> {
